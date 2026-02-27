@@ -500,7 +500,7 @@ class EmbyMetaRefreshCustom(_PluginBase):
             if not people.get("Name"):
                 continue
             if StringUtils.is_chinese(people.get("Name")) \
-                    and StringUtils.is_chinese(people.get("Role")):
+                    and StringUtils.is_chinese(people.get("Role")) \
                     and people.get("PrimaryImageTag"):
                 peoples.append(people)
                 continue
