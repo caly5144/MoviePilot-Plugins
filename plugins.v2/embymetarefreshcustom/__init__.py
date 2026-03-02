@@ -43,7 +43,7 @@ class EmbyMetaRefreshCustom(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/caly5144/MoviePilot-Plugins/main/icons/Emby_A.png"
     # 插件版本
-    plugin_version = "2.4.3"
+    plugin_version = "2.4.2"
     # 插件作者
     plugin_author = "caly5144"
     # 作者主页
@@ -219,6 +219,7 @@ class EmbyMetaRefreshCustom(_PluginBase):
 
                 # 最新入库的豆瓣演员缓存字典（防止单集重复请求）
                 handle_items_cache = {}
+                processed_series = set()
 
                 for item in latest:
                     try:
@@ -279,6 +280,23 @@ class EmbyMetaRefreshCustom(_PluginBase):
                             title = item.get('SeriesName') if is_episode else item.get('Name')
                             item_id = item.get("Id")
                             
+                            # 👇 核心修改 1：如果是电视剧，必须把“剧集主干（Series）”也顺带处理一遍
+                            if is_episode:
+                                series_id = item.get("SeriesId")
+                                # 如果这个剧集主干还没处理过，就处理一下
+                                if series_id and series_id not in processed_series:
+                                    logger.info(f"附加任务：顺带处理剧集《{title}》主页的演员信息 ({series_id})")
+                                    self.__update_people_chi(
+                                        item_id=series_id,
+                                        title=title,
+                                        type=mtype,
+                                        season=None, # 剧集主干不传 season
+                                        emby=emby,
+                                        cache_dict=handle_items_cache
+                                    )
+                                    processed_series.add(series_id) # 标记为已处理，防止后续集数重复处理主干
+                            
+                            # 👇 核心修改 2：继续处理当前的单集（Episode）或电影（Movie）
                             self.__update_people_chi(
                                 item_id=item_id,
                                 title=title,
@@ -673,6 +691,7 @@ class EmbyMetaRefreshCustom(_PluginBase):
 
                 self.__refresh_emby_library_by_id(item_id=episode_item_id)
                 if self._actor_chi:
+                    self.__update_people_chi(item_id=item_id, title=transferinfo.title, type=MediaType.TV, season=None, emby=emby, cache_dict=cache_dict)
                     self.__update_people_chi(item_id=episode_item_id, title=transferinfo.title, type=MediaType.TV, season=season, emby=emby, cache_dict=cache_dict)
         except Exception as e:
             logger.error(f"刷新Emby出错：{e}")
