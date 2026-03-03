@@ -43,7 +43,7 @@ class EmbyMetaRefreshCustom(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/caly5144/MoviePilot-Plugins/main/icons/Emby_A.png"
     # 插件版本
-    plugin_version = "2.4.2"
+    plugin_version = "2.4.4"
     # 插件作者
     plugin_author = "caly5144"
     # 作者主页
@@ -372,7 +372,6 @@ class EmbyMetaRefreshCustom(_PluginBase):
                     imdb_id = item_info.get("ProviderIds", {}).get("Imdb")
                     logger.info(f"开始获取 {title} ({item_info.get('ProductionYear')}) 的豆瓣/TMDB演员信息 ...")
                     douban_actors = self.__get_douban_actors(title=title, imdb_id=imdb_id, type=type, year=item_info.get("ProductionYear"), season=season)
-                    
                     if cache_dict is not None:
                         cache_dict[cache_key] = douban_actors or []
 
@@ -393,9 +392,15 @@ class EmbyMetaRefreshCustom(_PluginBase):
             if not people.get("Name"):
                 continue
                 
-            # 精准跳过：姓名、角色都是中文，并且已经拥有头像 (PrimaryImageTag)
-            if StringUtils.is_chinese(people.get("Name")) \
-                    and StringUtils.is_chinese(people.get("Role")) \
+            name = people.get("Name") or ""
+            role = people.get("Role") or ""
+            has_space = " " in name or "　" in name or "・" in name
+            has_kana = bool(re.search(r'[\u3040-\u309F\u30A0-\u30FF]', name))
+
+            # 精准跳过：姓名角色是中文 + 无空格中圆点 + 无日文假名 + 已有头像
+            if not has_space and not has_kana \
+                    and StringUtils.is_chinese(name) \
+                    and StringUtils.is_chinese(role) \
                     and people.get("PrimaryImageTag"):
                 peoples.append(people)
                 continue
@@ -445,7 +450,7 @@ class EmbyMetaRefreshCustom(_PluginBase):
             if "imdb" in p["ProviderIds"]: peopleimdbid = p["ProviderIds"]["imdb"]
             return peopletmdbid, peopleimdbid
 
-        # 使用浅拷贝提升性能
+        # 返回的人物信息 - 使用浅拷贝替代深拷贝以减少内存使用
         ret_people = people.copy()
         for key, value in people.items():
             if isinstance(value, dict):
@@ -453,10 +458,17 @@ class EmbyMetaRefreshCustom(_PluginBase):
             elif isinstance(value, list):
                 ret_people[key] = value.copy()
 
+        # 核心预处理工具：清理所有空白符、中圆点，并转为简体
+        def clean_name(name_str):
+            if not name_str: return ""
+            s = re.sub(r'[\s・·]', '', name_str).lower()
+            return zhconv.convert(s, "zh-hans")
+
         try:
+            # 查询媒体库人物详情
             personinfo = __get_emby_iteminfo()
             if not personinfo:
-                logger.debug(f"未找到人物 {people.get('Name')} 的信息")
+                logger.warn(f"未找到人物 {people.get('Name')} 的信息")
                 return None
 
             updated_name = False
@@ -464,10 +476,19 @@ class EmbyMetaRefreshCustom(_PluginBase):
             update_character = False
             profile_path = None
 
+            emby_name = people.get("Name") or ""
+            emby_name_clean = clean_name(emby_name)
+            # 提取名字中的汉字，用于模糊重叠匹配
+            emby_kanji = "".join(re.findall(r'[\u4e00-\u9fa5]', emby_name))
+            
+            tmdb_name_clean = ""
+
+            # 1. 从TMDB信息中更新人物信息
             person_tmdbid, person_imdbid = __get_peopleid(personinfo)
             if person_tmdbid:
                 person_detail = self.tmdbchain.person_detail(int(person_tmdbid))
                 if person_detail:
+                    tmdb_name_clean = clean_name(person_detail.name)
                     cn_name = self.__get_chinese_name(person_detail)
                     profile_path = person_detail.profile_path
                     if profile_path:
@@ -476,40 +497,74 @@ class EmbyMetaRefreshCustom(_PluginBase):
                         personinfo["Name"] = cn_name
                         ret_people["Name"] = cn_name
                         updated_name = True
-                        biography = person_detail.biography
-                        if biography and StringUtils.is_chinese(biography):
-                            personinfo["Overview"] = biography
-                            updated_overview = True
+                    biography = person_detail.biography
+                    if biography and StringUtils.is_chinese(biography):
+                        personinfo["Overview"] = biography
+                        updated_overview = True
 
-            if douban_actors and (not updated_name or not updated_overview or not update_character):
+            # 2. 从豆瓣信息中更新人物信息
+            if douban_actors:
+                matched_douban_actor = None
+                
                 for douban_actor in douban_actors:
-                    if douban_actor.get("latin_name") == people.get("Name") or douban_actor.get("name") == people.get("Name"):
-                        if not updated_name:
-                            personinfo["Name"] = douban_actor.get("name")
-                            ret_people["Name"] = douban_actor.get("name")
-                            updated_name = True
-                        if not updated_overview and douban_actor.get("title"):
-                            personinfo["Overview"] = douban_actor.get("title")
-                            updated_overview = True
-                        if not update_character and douban_actor.get("character"):
-                            character = re.sub(r"饰\s+", "", douban_actor.get("character"))
-                            character = re.sub("演员|voice", "", character)
-                            character = re.sub("Director", "导演", character)
-                            if character:
-                                ret_people["Role"] = character
-                                update_character = True
-                        if not profile_path:
-                            avatar = douban_actor.get("avatar") or {}
-                            if avatar.get("large"):
-                                profile_path = avatar.get("large")
+                    db_name = douban_actor.get("name") or ""
+                    db_latin = douban_actor.get("latin_name") or ""
+                    db_name_clean = clean_name(db_name)
+                    db_latin_clean = clean_name(db_latin)
+                    
+                    # 规则A：强力清洗后相等 (解决所有空格和 亜/亚 繁简问题)
+                    if (emby_name_clean and emby_name_clean in [db_name_clean, db_latin_clean]) or \
+                       (tmdb_name_clean and tmdb_name_clean in [db_name_clean, db_latin_clean]):
+                        matched_douban_actor = douban_actor
+                        break
+                        
+                    # 规则B：汉字重叠模糊匹配 (解决 高石あかり vs 高石明里)
+                    if len(emby_kanji) >= 2 and emby_kanji in db_name:
+                        matched_douban_actor = douban_actor
                         break
 
-            # 更新人物图片，此处独立于文本更新
-            if profile_path:
-                logger.debug(f"更新人物 {people.get('Name')} 的图片：{profile_path}")
+                if matched_douban_actor:
+                    db_name = matched_douban_actor.get("name")
+                    current_name = personinfo.get("Name") or ""
+                    
+                    # 关键修改：如果现在的名字包含空格、中圆点或【日文假名】，强制用豆瓣纯中文名覆盖！
+                    has_dirty_chars = bool(re.search(r'[\s・·\u3040-\u309F\u30A0-\u30FF]', current_name))
+                    
+                    if not updated_name or has_dirty_chars:
+                        logger.info(f"{emby_name} 匹配成功，从豆瓣获取到纯净中文名：{db_name}")
+                        personinfo["Name"] = db_name
+                        ret_people["Name"] = db_name
+                        updated_name = True
+                    
+                    if not updated_overview and matched_douban_actor.get("title"):
+                        personinfo["Overview"] = matched_douban_actor.get("title")
+                        updated_overview = True
+                        
+                    if not update_character and matched_douban_actor.get("character"):
+                        character = re.sub(r"饰\s+", "", matched_douban_actor.get("character"))
+                        character = re.sub("演员|voice|Director|配音|导演", "", character)
+                        if character:
+                            ret_people["Role"] = character
+                            update_character = True
+                            
+                    if not profile_path:
+                        avatar = matched_douban_actor.get("avatar") or {}
+                        if avatar.get("large"):
+                            profile_path = avatar.get("large")
+
+            # 3. 终极保底：如果全网没匹配上，但名字里有空格/中圆点，强制本地清理！
+            if not updated_name and re.search(r'[\s・·]', emby_name):
+                cleaned_fallback = re.sub(r'[\s・·]', '', emby_name)
+                personinfo["Name"] = cleaned_fallback
+                ret_people["Name"] = cleaned_fallback
+                updated_name = True
+                logger.info(f"API未匹配，执行本地强力去空格：{emby_name} -> {cleaned_fallback}")
+
+            # 4. 更新人物图片
+            if profile_path and not people.get("PrimaryImageTag"):
                 self.set_item_image(itemid=people.get("Id"), imageurl=profile_path, emby=emby)
 
-            # 锁定修改过的文本字段
+            # 5. 锁定人物信息
             if updated_name:
                 if "LockedFields" not in personinfo: personinfo["LockedFields"] = []
                 if "Name" not in personinfo["LockedFields"]: personinfo["LockedFields"].append("Name")
@@ -517,7 +572,7 @@ class EmbyMetaRefreshCustom(_PluginBase):
                 if "LockedFields" not in personinfo: personinfo["LockedFields"] = []
                 if "Overview" not in personinfo["LockedFields"]: personinfo["LockedFields"].append("Overview")
 
-            # 只有当文本属性发生变化时，才需向Emby提交完整详情覆盖
+            # 6. 保存到 Emby
             if updated_name or updated_overview or update_character:
                 ret = self.set_iteminfo(itemid=people.get("Id"), iteminfo=personinfo, emby=emby)
                 if ret:
@@ -638,14 +693,23 @@ class EmbyMetaRefreshCustom(_PluginBase):
     @staticmethod
     def __need_trans_actor(item):
         """
-        严谨检查：无人员返回 True 去刮削，含非中文名、非中文角色或无头像返回 True
+        含非中文名、非中文角色、无头像、含空格/中圆点、含日文假名，均返回 True
         """
         peoples = item.get("People") or []
         if not peoples:
             return True
         for x in peoples:
-            if (x.get("Name") and not StringUtils.is_chinese(x.get("Name"))) \
-               or (x.get("Role") and not StringUtils.is_chinese(x.get("Role"))) \
+            name = x.get("Name") or ""
+            role = x.get("Role") or ""
+            
+            # 检测是否包含空格(半角/全角)、中圆点
+            has_space = " " in name or "　" in name or "・" in name
+            # 检测是否包含日文平假名、片假名
+            has_kana = bool(re.search(r'[\u3040-\u309F\u30A0-\u30FF]', name))
+            
+            if has_space or has_kana \
+               or (name and not StringUtils.is_chinese(name)) \
+               or (role and not StringUtils.is_chinese(role)) \
                or not x.get("PrimaryImageTag"):
                 return True
         return False
