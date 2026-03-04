@@ -458,11 +458,32 @@ class EmbyMetaRefreshCustom(_PluginBase):
             elif isinstance(value, list):
                 ret_people[key] = value.copy()
 
-        # 核心预处理工具：清理所有空白符、中圆点，并转为简体
-        def clean_name(name_str):
+        # 预处理工具：清理所有空白符、中圆点，仅用于匹配对比
+        def clean_name_for_match(name_str):
             if not name_str: return ""
             s = re.sub(r'[\s・·]', '', name_str).lower()
             return zhconv.convert(s, "zh-hans")
+
+        # 核心展示名格式化工具：去除亚洲名空格，推导 々，转简体，放行欧美名
+        def format_display_name(name_str):
+            if not name_str: return ""
+            has_english = bool(re.search(r'[a-zA-Z]', name_str))
+            is_western = "·" in name_str or has_english
+            
+            if not is_western:
+                # 1. 去除空格、全角空格、日文间隔号(・)
+                res = re.sub(r'[\s・　]', '', name_str)
+                # 2. 智能处理日文叠字号 々 (如 大冢宁々 -> 大冢宁宁)
+                temp = ""
+                for i, char in enumerate(res):
+                    if char == '々' and i > 0:
+                        temp += temp[-1] # 重复前一个字
+                    else:
+                        temp += char
+                res = temp
+                # 3. 繁简转换 (如 亜 -> 亚)
+                return zhconv.convert(res, "zh-hans")
+            return name_str
 
         try:
             # 查询媒体库人物详情
@@ -477,63 +498,99 @@ class EmbyMetaRefreshCustom(_PluginBase):
             profile_path = None
 
             emby_name = people.get("Name") or ""
-            emby_name_clean = clean_name(emby_name)
+            emby_name_clean = clean_name_for_match(emby_name)
             # 提取名字中的汉字，用于模糊重叠匹配
             emby_kanji = "".join(re.findall(r'[\u4e00-\u9fa5]', emby_name))
             
             tmdb_name_clean = ""
+            
+            # 【核心护盾】：判断 Emby 原始名字是否已经是完美的亚洲中文
+            has_english = bool(re.search(r'[a-zA-Z]', emby_name))
+            has_kana = bool(re.search(r'[\u3040-\u309F\u30A0-\u30FF]', emby_name))
+            has_dirty_space = bool(re.search(r'[\s・　]', emby_name))
+            is_western = "·" in emby_name or has_english
+            
+            emby_is_pure_asian = (
+                not is_western 
+                and not has_kana 
+                and not has_dirty_space 
+                and "々" not in emby_name
+                and StringUtils.is_chinese(emby_name)
+            )
 
             # 1. 从TMDB信息中更新人物信息
             person_tmdbid, person_imdbid = __get_peopleid(personinfo)
             if person_tmdbid:
                 person_detail = self.tmdbchain.person_detail(int(person_tmdbid))
                 if person_detail:
-                    tmdb_name_clean = clean_name(person_detail.name)
+                    tmdb_name_clean = clean_name_for_match(person_detail.name)
                     cn_name = self.__get_chinese_name(person_detail)
+                    
+                    # 关键修复：对 TMDB 获取的中文名进行强力洗涤！
+                    formatted_cn_name = format_display_name(cn_name)
+                    
                     profile_path = person_detail.profile_path
                     if profile_path:
                         profile_path = f"https://{settings.TMDB_IMAGE_DOMAIN}/t/p/original{profile_path}"
-                    if cn_name:
-                        personinfo["Name"] = cn_name
-                        ret_people["Name"] = cn_name
-                        updated_name = True
+                    
+                    if formatted_cn_name:
+                        # 护盾生效：如果 Emby 已经是完美中文，拒绝 TMDB 污染！
+                        if not emby_is_pure_asian:
+                            personinfo["Name"] = formatted_cn_name
+                            ret_people["Name"] = formatted_cn_name
+                            updated_name = True
+                            
                     biography = person_detail.biography
                     if biography and StringUtils.is_chinese(biography):
                         personinfo["Overview"] = biography
                         updated_overview = True
 
             # 2. 从豆瓣信息中更新人物信息
-            if douban_actors:
+            if douban_actors and (not updated_name or not updated_overview or not update_character):
                 matched_douban_actor = None
                 
                 for douban_actor in douban_actors:
                     db_name = douban_actor.get("name") or ""
                     db_latin = douban_actor.get("latin_name") or ""
-                    db_name_clean = clean_name(db_name)
-                    db_latin_clean = clean_name(db_latin)
+                    db_name_clean = clean_name_for_match(db_name)
+                    db_latin_clean = clean_name_for_match(db_latin)
                     
-                    # 规则A：强力清洗后相等 (解决所有空格和 亜/亚 繁简问题)
                     if (emby_name_clean and emby_name_clean in [db_name_clean, db_latin_clean]) or \
                        (tmdb_name_clean and tmdb_name_clean in [db_name_clean, db_latin_clean]):
                         matched_douban_actor = douban_actor
                         break
                         
-                    # 规则B：汉字重叠模糊匹配 (解决 高石あかり vs 高石明里)
                     if len(emby_kanji) >= 2 and emby_kanji in db_name:
                         matched_douban_actor = douban_actor
                         break
 
                 if matched_douban_actor:
                     db_name = matched_douban_actor.get("name")
+                    formatted_db_name = format_display_name(db_name)
+                    
                     current_name = personinfo.get("Name") or ""
                     
-                    # 关键修改：如果现在的名字包含空格、中圆点或【日文假名】，强制用豆瓣纯中文名覆盖！
-                    has_dirty_chars = bool(re.search(r'[\s・·\u3040-\u309F\u30A0-\u30FF]', current_name))
+                    curr_has_kana = bool(re.search(r'[\u3040-\u309F\u30A0-\u30FF]', current_name))
+                    curr_has_english = bool(re.search(r'[a-zA-Z]', current_name))
+                    curr_is_western = "·" in current_name or curr_has_english
                     
-                    if not updated_name or has_dirty_chars:
-                        logger.info(f"{emby_name} 匹配成功，从豆瓣获取到纯净中文名：{db_name}")
-                        personinfo["Name"] = db_name
-                        ret_people["Name"] = db_name
+                    curr_has_dirty_space = False
+                    if not curr_is_western:
+                        curr_has_dirty_space = bool(re.search(r'[\s・　]', current_name))
+                        
+                    curr_has_iteration = "々" in current_name
+                    
+                    # 允许豆瓣覆盖条件：之前没更新且原名不完美，或者当前名字处于被污染状态
+                    allow_overwrite = False
+                    if not updated_name and not emby_is_pure_asian:
+                        allow_overwrite = True
+                    elif curr_has_kana or curr_has_dirty_space or curr_has_iteration or curr_has_english:
+                        allow_overwrite = True
+
+                    if allow_overwrite:
+                        logger.info(f"{emby_name} 匹配成功，从豆瓣获取到纯净中文名：{formatted_db_name}")
+                        personinfo["Name"] = formatted_db_name
+                        ret_people["Name"] = formatted_db_name
                         updated_name = True
                     
                     if not updated_overview and matched_douban_actor.get("title"):
@@ -552,13 +609,16 @@ class EmbyMetaRefreshCustom(_PluginBase):
                         if avatar.get("large"):
                             profile_path = avatar.get("large")
 
-            # 3. 终极保底：如果全网没匹配上，但名字里有空格/中圆点，强制本地清理！
-            if not updated_name and re.search(r'[\s・·]', emby_name):
-                cleaned_fallback = re.sub(r'[\s・·]', '', emby_name)
-                personinfo["Name"] = cleaned_fallback
-                ret_people["Name"] = cleaned_fallback
-                updated_name = True
-                logger.info(f"API未匹配，执行本地强力去空格：{emby_name} -> {cleaned_fallback}")
+            # 3. 终极保底：如果全网没匹配上，本地智能清理
+            if not updated_name:
+                emby_name = people.get("Name") or ""
+                formatted_emby = format_display_name(emby_name)
+                
+                if formatted_emby != emby_name:
+                    personinfo["Name"] = formatted_emby
+                    ret_people["Name"] = formatted_emby
+                    updated_name = True
+                    logger.info(f"API未匹配，执行本地智能清理：{emby_name} -> {formatted_emby}")
 
             # 4. 更新人物图片
             if profile_path and not people.get("PrimaryImageTag"):
